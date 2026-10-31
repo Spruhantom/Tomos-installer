@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# PunkSway guided Arch Linux installer — UEFI/GPT, destructive disk operation.
+set -Eeuo pipefail
+
+APP="PunkSway Installer"
+BLUE=$'\e[1;96m'; PURPLE=$'\e[1;95m'; RESET=$'\e[0m'
+say(){ printf '%s%s%s\n' "$BLUE" "$*" "$RESET"; }
+fail(){ printf '\n%sERROR:%s %s\n' "$PURPLE" "$RESET" "$*" >&2; exit 1; }
+need(){ command -v "$1" >/dev/null 2>&1 || fail "Required command missing: $1"; }
+for c in lsblk whiptail parted mkfs.fat mkfs.ext4 pacstrap arch-chroot genfstab blkid; do need "$c"; done
+[[ $EUID -eq 0 ]] || fail "Run this installer as root."
+[[ -d /sys/firmware/efi ]] || fail "This installer currently supports UEFI boot only. Restart the USB in UEFI mode."
+
+whiptail --title "$APP" --msgbox "Welcome to PunkSway\n\nArch Linux • Niri • Dux Shell • Ly\n\nThis guided installer will create a fresh system on a drive you select. The selected drive will be erased completely. Back up anything important before continuing." 15 64
+
+mapfile -t DISKS < <(lsblk -dpno NAME,SIZE,MODEL,TYPE | awk '$4=="disk"{print $1 "|" $2 " " $3}')
+(("${#DISKS[@]}" > 0)) || fail "No installation disks detected."
+MENU=()
+for item in "${DISKS[@]}"; do dev="${item%%|*}"; desc="${item#*|}"; MENU+=("$dev" "$desc"); done
+DISK=$(whiptail --title "Choose installation drive" --menu "Select the drive to ERASE and install PunkSway onto:" 20 78 10 "${MENU[@]}" 3>&1 1>&2 2>&3) || exit 0
+DETAIL=$(lsblk -dnpo NAME,SIZE,MODEL "$DISK")
+whiptail --title "Confirm drive" --yesno "You selected:\n\n$DETAIL\n\nALL PARTITIONS AND DATA ON THIS DRIVE WILL BE ERASED. Continue?" 14 72 || exit 0
+CONFIRM=$(whiptail --title "Final confirmation" --inputbox "To confirm erasing $DISK, type exactly:\n\nERASE" 12 64 3>&1 1>&2 2>&3) || exit 0
+[[ "$CONFIRM" == "ERASE" ]] || fail "Confirmation did not match. No changes made."
+
+HOSTNAME=$(whiptail --title "System name" --inputbox "Choose a hostname:" 10 60 "punksway" 3>&1 1>&2 2>&3) || exit 0
+[[ "$HOSTNAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$ ]] || fail "Invalid hostname."
+USERNAME=$(whiptail --title "User account" --inputbox "Choose your username:" 10 60 "tom" 3>&1 1>&2 2>&3) || exit 0
+[[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || fail "Invalid username."
+PASSWORD=$(whiptail --title "User password" --passwordbox "Choose a password for $USERNAME:" 10 60 3>&1 1>&2 2>&3) || exit 0
+[[ "${#PASSWORD}" -ge 8 ]] || fail "Use a password of at least 8 characters."
+PASSWORD2=$(whiptail --title "Confirm password" --passwordbox "Enter the password again:" 10 60 3>&1 1>&2 2>&3) || exit 0
+[[ "$PASSWORD" == "$PASSWORD2" ]] || fail "Passwords do not match."
+TIMEZONE=$(whiptail --title "Timezone" --inputbox "Enter an Olson timezone (example: Europe/London):" 10 64 "Europe/London" 3>&1 1>&2 2>&3) || exit 0
+[[ -e "/usr/share/zoneinfo/$TIMEZONE" ]] || fail "Unknown timezone: $TIMEZONE"
+
+TERMINAL=foot
+BROWSER=firefox
+if [[ -r /etc/punksway-build-options ]]; then source /etc/punksway-build-options; fi
+[[ "$TERMINAL" == kitty || "$TERMINAL" == foot ]] || fail "Invalid terminal selection."
+[[ "$BROWSER" == firefox || "$BROWSER" == chrome ]] || fail "Invalid browser selection."
+
+whiptail --title "Ready to install" --yesno "PunkSway will now erase $DISK and install Arch Linux.\n\nHostname: $HOSTNAME\nUser: $USERNAME\nTimezone: $TIMEZONE\nDesktop: Niri + Dux Shell\nTerminal: $TERMINAL\nBrowser: $BROWSER\nLogin manager: Ly\n\nKeep the computer powered on and connected to the internet. Start installation?" 18 72 || exit 0
+
+exec > >(tee /var/log/punksway-installer.log) 2>&1
+say "Preparing partitions on $DISK..."
+parted -s "$DISK" mklabel gpt
+parted -s "$DISK" mkpart ESP fat32 1MiB 1025MiB
+parted -s "$DISK" set 1 esp on
+parted -s "$DISK" mkpart primary ext4 1025MiB 100%
+partprobe "$DISK"
+udevadm settle
+if [[ "$DISK" =~ (nvme|mmcblk) ]]; then EFI="${DISK}p1"; ROOT="${DISK}p2"; else EFI="${DISK}1"; ROOT="${DISK}2"; fi
+[[ -b "$EFI" && -b "$ROOT" ]] || fail "Could not find the new partitions. Check /var/log/punksway-installer.log."
+say "Formatting EFI and root partitions..."
+mkfs.fat -F32 "$EFI"
+mkfs.ext4 -F "$ROOT"
+mount "$ROOT" /mnt
+mkdir -p /mnt/boot
+mount "$EFI" /mnt/boot
+
+DESKTOP_PACKAGES=(base linux linux-firmware mkinitcpio grub efibootmgr plymouth networkmanager sudo niri dms-shell-niri ly "$TERMINAL" xdg-desktop-portal xdg-desktop-portal-gtk pipewire pipewire-alsa pipewire-pulse wireplumber pavucontrol polkit polkit-gnome xorg-xwayland xdg-user-dirs xdg-utils wl-clipboard cliphist grim slurp brightnessctl playerctl thunar gvfs gvfs-mtp gvfs-smb udisks2 mesa ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji papirus-icon-theme intel-ucode amd-ucode)
+if [[ "$BROWSER" == firefox ]]; then DESKTOP_PACKAGES+=(firefox); fi
+say "Installing Arch Linux and PunkSway desktop packages..."
+pacstrap -K /mnt "${DESKTOP_PACKAGES[@]}"
+if [[ "$BROWSER" == chrome ]]; then
+    CHROME_PACKAGE="/usr/share/punksway/packages/google-chrome.pkg.tar.zst"
+    [[ -f "$CHROME_PACKAGE" ]] || fail "The Google Chrome package is missing from this installation media."
+    install -D -m 0644 "$CHROME_PACKAGE" /mnt/root/google-chrome.pkg.tar.zst
+    arch-chroot /mnt pacman -Syu --noconfirm
+    arch-chroot /mnt pacman -U --noconfirm /root/google-chrome.pkg.tar.zst
+    rm -f /mnt/root/google-chrome.pkg.tar.zst
+fi
+genfstab -U /mnt >> /mnt/etc/fstab
+install -d /mnt/etc
+printf '%s\n' "$HOSTNAME" > /mnt/etc/hostname
+cat > /mnt/etc/locale.gen <<'LOCALE'
+en_GB.UTF-8 UTF-8
+LOCALE
+cat > /mnt/etc/locale.conf <<'LOCALE'
+LANG=en_GB.UTF-8
+LOCALE
+cat > /mnt/etc/vconsole.conf <<'VCON'
+KEYMAP=uk
+VCON
+ln -sf "/usr/share/zoneinfo/$TIMEZONE" /mnt/etc/localtime
+arch-chroot /mnt locale-gen
+arch-chroot /mnt hwclock --systohc
+arch-chroot /mnt systemctl enable NetworkManager.service
+arch-chroot /mnt systemctl enable ly.service
+arch-chroot /mnt systemctl set-default graphical.target
+arch-chroot /mnt useradd -m -G wheel,audio,video,storage -s /bin/bash "$USERNAME"
+printf '%s:%s\n' "$USERNAME" "$PASSWORD" | arch-chroot /mnt chpasswd
+unset PASSWORD PASSWORD2
+install -d /mnt/etc/sudoers.d
+printf '%%wheel ALL=(ALL:ALL) ALL\n' > /mnt/etc/sudoers.d/10-wheel
+chmod 440 /mnt/etc/sudoers.d/10-wheel
+install -d "/mnt/home/$USERNAME/.config/niri"
+cat > "/mnt/home/$USERNAME/.config/niri/config.kdl" <<'NIRI'
+input {
+    keyboard { xkb { layout "gb" } }
+    touchpad { tap; natural-scroll }
+}
+layout {
+    gaps 10
+    center-focused-column "never"
+    focus-ring { width 2; active-color "#00c8ff"; inactive-color "#263746" }
+    border { off }
+}
+prefer-no-csd
+spawn-at-startup "dbus-update-activation-environment" "--all"
+spawn-at-startup "dms" "run"
+binds {
+    Mod+Return { spawn "foot"; }
+    Mod+D { spawn "dms" "ipc" "call" "spotlight" "toggle"; }
+    Mod+Q { close-window; }
+    Mod+F { fullscreen-window; }
+    Mod+Space { toggle-overview; }
+    Mod+Left { focus-column-left; }
+    Mod+Right { focus-column-right; }
+    Mod+1 { focus-workspace 1; }
+    Mod+2 { focus-workspace 2; }
+    Mod+3 { focus-workspace 3; }
+}
+NIRI
+sed -i 's/spawn "foot"/spawn "'"$TERMINAL"'"/' "/mnt/home/$USERNAME/.config/niri/config.kdl"
+chown -R "$USERNAME:$USERNAME" "/mnt/home/$USERNAME"
+# Install the generated Tom OS Plymouth and GRUB theme into the target system.
+install -d /mnt/usr/share/plymouth/themes/tomos /mnt/boot/grub/themes/punksway /mnt/etc/plymouth
+cp -a /usr/share/plymouth/themes/tomos/. /mnt/usr/share/plymouth/themes/tomos/
+cp -a /usr/share/punksway/grub-theme/. /mnt/boot/grub/themes/punksway/
+arch-chroot /mnt grub-mkfont -s 18 -o /boot/grub/themes/punksway/noto-regular.pf2 /usr/share/fonts/noto/NotoSans-Regular.ttf
+arch-chroot /mnt grub-mkfont -s 18 -o /boot/grub/themes/punksway/noto-bold.pf2 /usr/share/fonts/noto/NotoSans-Bold.ttf
+cat > /mnt/etc/plymouth/plymouthd.conf <<'PLYMOUTH'
+[Daemon]
+Theme=tomos
+ShowDelay=0
+PLYMOUTH
+# Add Plymouth to the initramfs hook chain before filesystem mounting.
+if grep -q '^HOOKS=' /mnt/etc/mkinitcpio.conf; then
+    sed -i '/^HOOKS=/s/udev /udev plymouth /' /mnt/etc/mkinitcpio.conf
+else
+    fail "Could not find HOOKS in the target mkinitcpio configuration."
+fi
+if ! grep -q '^HOOKS=.*plymouth' /mnt/etc/mkinitcpio.conf; then
+    fail "Could not enable the Plymouth mkinitcpio hook."
+fi
+if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' /mnt/etc/default/grub; then
+    sed -i 's|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT="quiet splash loglevel=3 vt.global_cursor_default=0"|' /mnt/etc/default/grub
+else
+    printf '%s\\n' 'GRUB_CMDLINE_LINUX_DEFAULT="quiet splash loglevel=3 vt.global_cursor_default=0"' >> /mnt/etc/default/grub
+fi
+if grep -q '^GRUB_FONT=' /mnt/etc/default/grub; then
+    sed -i 's|^GRUB_FONT=.*|GRUB_FONT="/boot/grub/themes/punksway/noto-regular.pf2"|' /mnt/etc/default/grub
+else
+    printf '%s\\n' 'GRUB_FONT="/boot/grub/themes/punksway/noto-regular.pf2"' >> /mnt/etc/default/grub
+fi
+if grep -q '^GRUB_THEME=' /mnt/etc/default/grub; then
+    sed -i 's|^GRUB_THEME=.*|GRUB_THEME="/boot/grub/themes/punksway/theme.txt"|' /mnt/etc/default/grub
+else
+    printf '%s\\n' 'GRUB_THEME="/boot/grub/themes/punksway/theme.txt"' >> /mnt/etc/default/grub
+fi
+arch-chroot /mnt grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=TomOS --recheck
+arch-chroot /mnt mkinitcpio -P
+arch-chroot /mnt grub-mkconfig -o /boot/grub/grub.cfg
+umount -R /mnt
+whiptail --title "Installation complete" --msgbox "PunkSway has been installed.\n\nRemove the USB drive and reboot.\n\nLog in as $USERNAME using the password you created. Ly will start the login screen." 14 68
+say "PunkSway installation completed."
