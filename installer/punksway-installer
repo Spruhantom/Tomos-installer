@@ -7,9 +7,13 @@ BLUE=$'\e[1;96m'; PURPLE=$'\e[1;95m'; RESET=$'\e[0m'
 say(){ printf '%s%s%s\n' "$BLUE" "$*" "$RESET"; }
 fail(){ printf '\n%sERROR:%s %s\n' "$PURPLE" "$RESET" "$*" >&2; exit 1; }
 need(){ command -v "$1" >/dev/null 2>&1 || fail "Required command missing: $1"; }
-for c in lsblk whiptail parted mkfs.fat mkfs.ext4 pacstrap arch-chroot genfstab blkid; do need "$c"; done
+for c in lsblk whiptail parted partprobe udevadm mkfs.fat mkfs.ext4 pacstrap arch-chroot genfstab blkid mount umount install cp chown sed grep tee awk; do need "$c"; done
 [[ $EUID -eq 0 ]] || fail "Run this installer as root."
 [[ -d /sys/firmware/efi ]] || fail "This installer currently supports UEFI boot only. Restart the USB in UEFI mode."
+for required in /usr/share/plymouth/themes/tomos/tomos.plymouth /usr/share/plymouth/themes/tomos/tomos.script /usr/share/plymouth/themes/tomos/tomos-splash.png /usr/share/plymouth/themes/tomos/tomos-progress-track.png /usr/share/plymouth/themes/tomos/tomos-progress-fill.png /usr/share/punksway/grub-theme/theme.txt /usr/share/punksway/grub-theme/background.png; do
+    [[ -s "$required" ]] || fail "Required theme asset is missing: $required. Rebuild or use the matching PunkSway ISO."
+done
+[[ -r /usr/share/fonts/noto/NotoSans-Regular.ttf && -r /usr/share/fonts/noto/NotoSans-Bold.ttf ]] || fail "Noto fonts are missing from the live ISO."
 
 whiptail --title "$APP" --msgbox "Welcome to PunkSway\n\nArch Linux • Niri • Dux Shell • Ly\n\nThis guided installer will create a fresh system on a drive you select. The selected drive will be erased completely. Back up anything important before continuing." 15 64
 
