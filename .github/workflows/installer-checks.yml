@@ -1,0 +1,21 @@
+name: Installer source checks
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  bash:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Bash syntax
+        run: bash -n installer/punksway-installer
+      - name: Check required installer safeguards
+        run: |
+          grep -q 'UEFI boot only' installer/punksway-installer
+          grep -q 'type exactly:' installer/punksway-installer
+          grep -q 'mkfs.fat' installer/punksway-installer
+          grep -q 'mkfs.ext4' installer/punksway-installer
+          grep -q 'grub-install' installer/punksway-installer
